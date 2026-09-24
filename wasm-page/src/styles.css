@@ -1339,6 +1339,11 @@ button.danger:hover { background: rgba(255,95,95,.1); border-color: var(--danger
 #gameInfoFavoriteBtn.active .lucide {
   fill: none;
 }
+#perfPresetBtn.active {
+  color: var(--accent);
+  border-color: rgba(0,212,170,.45);
+  background: rgba(0,212,170,.10);
+}
 #gameInfoModal {
   position: fixed; inset: 0; z-index: 9998;
   display: none; align-items: center; justify-content: center;

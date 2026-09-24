@@ -34,6 +34,7 @@ import {
   Triangle,
   Upload,
   X,
+  Zap,
   createIcons,
 } from 'lucide';
 
@@ -71,8 +72,9 @@ const PPSSPP_ICONS = {
   Triangle,
   Upload,
   X,
+  Zap,
 };
-const RUNTIME_ASSET_VERSION = '2026-06-03-preload-hard-drive-icon';
+const RUNTIME_ASSET_VERSION = '2026-09-24-perf-preset';
 
 @Injectable({ providedIn: 'root' })
 export class PpssppRuntime {

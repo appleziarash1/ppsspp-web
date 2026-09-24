@@ -22,11 +22,25 @@ const OPFS_GAMES_DIR      = "games";
 const OPFS_GAME_META_DIR  = "game-meta";
 const PERSIST_SYNC_MS     = 30000; // auto-sync every 30 s
 const MOBILE_EMULATOR_ARGS = ["--dpi", "1", "--xres", "1280", "--yres", "720"];
+
+const SPEED_PRESET_KEY = "ppsspp_speed_preset";
+// Adds a "Performance" preset to the ini. PPSSPP renders through WebGL2 here, so
+// the GPU work is real; these knobs only lower the cost of what is drawn.
+const SPEED_PRESET_CONFIG = [
+  // Auto = native 480x272. Rendering above the panel resolution costs fill rate
+  // and buys nothing visible on a phone-sized viewport.
+  ["Graphics", "InternalResolution", "1"],
+  // Auto frame skip costs an extra frame of latency; skipping up to 3 frames on
+  // the budget devices is more predictable.
+  ["Graphics", "AutoFrameSkip", "True"],
+  ["Graphics", "FrameSkip", "3"],
+  // Forcing nearest drops the per-texel filtering across every texture in the
+  // game, one of the cheaper wins on a weak GPU.
+  ["Graphics", "TextureFiltering", "2"],
+  ["Graphics", "SplineBezierQuality", "0"],
+  ["Graphics", "BloomHack", "0"],
+];
 const WEB_NATIVE_TIMING_CONFIG = [
-  ["General", "ForceLagSync2", "True"],
-  ["Graphics", "DisplayRefreshRate", "60"],
-  ["Graphics", "FrameRate", "0"],
-  ["Graphics", "FrameRate2", "-1"],
   ["Graphics", "FrameSkip", "0"],
   ["Graphics", "AutoFrameSkip", "False"],
   ["Graphics", "VerticalSync", "True"],
@@ -509,7 +523,6 @@ async function opfsPutGame(name, data) {
   const writable = await handle.createWritable();
   await writable.write(data);
   await writable.close();
-  setPreloadFavorite(safe, true);
   try { await writeGameMetadata(safe, data); }
   catch(e) { log("Library metadata failed for " + safe + ": " + e.message, "warn"); }
   return safe;
@@ -1068,29 +1081,29 @@ function setPreloadFavorite(name, enabled) {
   return savePreloadFavorites(next);
 }
 
+// Games are mounted from OPFS into wasm memory before PPSSPP starts, so a large
+// ISO delays or prevents startup. Only opt in per game, and never for files big
+// enough to eat the heap. Existing libraries keep whatever the user chose.
+const PRELOAD_MAX_BYTES = 96 * 1024 * 1024;
+
 function ensurePreloadFavoritesMigrated(existingNames) {
-  const existing = [...new Set(existingNames.filter(name => typeof name === "string" && name))];
-  const migrated = localStorage.getItem(PRELOAD_FAVORITES_MIGRATED_KEY) === "1";
-  const defaultsApplied = localStorage.getItem(PRELOAD_DEFAULTS_APPLIED_KEY) === "1";
-  if (migrated && defaultsApplied) return loadPreloadFavorites();
-
-  if (!migrated) localStorage.setItem(PRELOAD_FAVORITES_MIGRATED_KEY, "1");
-  if (!existing.length) {
-    localStorage.setItem(PRELOAD_DEFAULTS_APPLIED_KEY, "1");
-    updatePreloadFavoriteSummary(0);
-    return [];
-  }
-
-  const merged = savePreloadFavorites([...loadPreloadFavorites(), ...existing]);
+  localStorage.setItem(PRELOAD_FAVORITES_MIGRATED_KEY, "1");
   localStorage.setItem(PRELOAD_DEFAULTS_APPLIED_KEY, "1");
-  log("Startup preload: enabled by default for " + existing.length + " existing library game" + (existing.length === 1 ? "" : "s") + ".", "ok");
-  return merged;
+  return loadPreloadFavorites();
 }
 
-function prunePreloadFavorites(existingNames) {
-  const existing = new Set(existingNames);
-  const favorites = ensurePreloadFavoritesMigrated(existingNames);
-  const next = favorites.filter(name => existing.has(name));
+function prunePreloadFavorites(games) {
+  const byName = new Map(games.map(g => [typeof g === "string" ? g : g.name, g]));
+  const favorites = ensurePreloadFavoritesMigrated([...byName.keys()]);
+  let dropped = 0;
+  const next = favorites.filter(name => {
+    const game = byName.get(name);
+    if (!game) return false;                       // file was deleted
+    const size = typeof game === "string" ? 0 : (game.size || 0);
+    if (size > PRELOAD_MAX_BYTES) { dropped++; return false; }
+    return true;
+  });
+  if (dropped) log("Startup preload: skipped " + dropped + " game(s) larger than " + formatBytes(PRELOAD_MAX_BYTES) + ".", "info");
   if (next.length !== favorites.length) savePreloadFavorites(next);
   else updatePreloadFavoriteSummary(next.length);
   return next;
@@ -1808,6 +1821,15 @@ function patchIniValue(text, section, key, value) {
   return lines.join("\n").replace(/\n*$/, "\n");
 }
 
+function isSpeedPresetEnabled() {
+  return localStorage.getItem(SPEED_PRESET_KEY) === "1";
+}
+
+function setSpeedPresetEnabled(enabled) {
+  if (enabled) localStorage.setItem(SPEED_PRESET_KEY, "1");
+  else localStorage.removeItem(SPEED_PRESET_KEY);
+}
+
 function defaultNetworkServerHost() {
   const host = location.hostname || "127.0.0.1";
   return host === "localhost" ? "127.0.0.1" : host;
@@ -2261,6 +2283,11 @@ async function forceGamesDirectoryConfig(FS) {
       }
       for (const [section, key, value] of WEB_STABILITY_CONFIG) {
         patched = patchIniValue(patched, section, key, value);
+      }
+      if (isSpeedPresetEnabled()) {
+        for (const [section, key, value] of SPEED_PRESET_CONFIG) {
+          patched = patchIniValue(patched, section, key, value);
+        }
       }
       if (applyMobileTouchDefaults) {
         for (const [section, key, value] of MOBILE_TOUCH_CONFIG) {
@@ -4119,6 +4146,25 @@ function probeWebGLFeaturesWithPref(powerPreference) {
 
 function probeWebGLFeatures() { probeWebGLFeaturesWithPref(gpuSelectEl?.value || "high-performance"); }
 
+const perfPresetBtn = byId("perfPresetBtn");
+
+function syncPerfPresetButton() {
+  if (!perfPresetBtn) return;
+  const on = isSpeedPresetEnabled();
+  perfPresetBtn.setAttribute("aria-pressed", String(on));
+  perfPresetBtn.classList.toggle("active", on);
+}
+
+on(perfPresetBtn, "click", () => {
+  const on = !isSpeedPresetEnabled();
+  setSpeedPresetEnabled(on);
+  syncPerfPresetButton();
+  showToast(on ? "Performance mode on — restart to apply" : "Performance mode off — restart to apply");
+  log("Performance preset " + (on ? "enabled" : "disabled") + "; restart PPSSPP to re-apply graphics settings.", "ok");
+});
+
+syncPerfPresetButton();
+
 on(gpuSelectEl, "change", () => {
   log('GPU selector changed to "' + gpuSelectEl.value + '" — re-probing WebGL...');
   probeWebGLFeaturesWithPref(gpuSelectEl.value);
@@ -4219,7 +4265,7 @@ async function preloadStoredGames(FS) {
   }
 
   FS.mkdirTree(VIRTUAL_GAME_DIR);
-  const favorites = prunePreloadFavorites(games.map(game => game.path)).filter(name => name !== selectedStoredGame);
+  const favorites = prunePreloadFavorites(games);
   if (!favorites.length) {
     log("OPFS games: " + games.length + " stored file(s) available. No startup preload games selected.", "ok");
     return 0;
@@ -4233,6 +4279,10 @@ async function preloadStoredGames(FS) {
       setStatus("Preloading game " + (ok + 1) + "/" + favorites.length + ": " + name, "run");
       showLoading("Preloading game: " + name);
       const data = await opfsReadGame(name);
+      if (!data.byteLength) {
+        log("Startup preload skipped " + name + ": stored file is empty.", "warn");
+        continue;
+      }
       FS.writeFile(target, data);
       ok++;
       bytesMounted += data.byteLength || 0;
