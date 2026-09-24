@@ -11,8 +11,12 @@ const MANIFEST         = "assets-manifest.txt";
 const USE_PRELOADED_ASSETS = true;
 const VIRTUAL_ASSETS   = "/emsdk/upstream/emscripten/cache/sysroot/share/ppsspp/assets";
 const VIRTUAL_GAME_DIR = "/games";
-const GAME_FILE_ACCEPT = ".iso,.cso,.chd,.pbp,.elf,.prx";
-const GAME_FILE_EXT_RE = /\.(iso|cso|chd|pbp|elf|prx)$/i;
+const GAME_FILE_ACCEPT = ".iso,.cso,.chd,.pbp,.elf,.prx,.csz,.zip";
+// PSP homebrews ship as a folder: a bootable EBOOT.PBP plus data files beside
+// it. Cave Story, for example, will not boot without data.csz next to the
+// EBOOT. Anything else is mounted alongside the boot target.
+const GAME_BOOT_EXTS  = ["pbp", "elf", "prx", "iso", "cso", "chd"];
+const GAME_FILE_EXT_RE = /\.(iso|cso|chd|pbp|elf|prx|csz)$/i;
 
 // Persistence: PPSSPP writes config+saves to $HOME/.config/ppsspp/ on Linux/Emscripten
 const PERSIST_ROOTS       = ["/home/web_user/.config/ppsspp", "/root/.config/ppsspp"];
@@ -374,6 +378,8 @@ networkTestBtn?.addEventListener("click", testNetworkRelay);
 /* ── State ──────────────────────────────────────────────────────── */
 let selectedGame = null;
 let selectedStoredGame = null;
+// Data files that must be mounted next to the selected game's boot file.
+let selectedSiblings = [];
 let started      = false;
 let runtimeReady = false;
 const trackedAudioContexts = [];
@@ -544,6 +550,105 @@ async function opfsDeleteGame(name) {
   const { dir, name: fileName } = await opfsParent(name, false, OPFS_GAMES_DIR);
   await dir.removeEntry(fileName);
   await deleteGameMetadata(name);
+}
+
+/* ── Multi-file game selection ──────────────────────────────────────
+   A PSP homebrew is a folder, not a single file. The user may pick the
+   whole folder, or a .zip of it, or just tick the boot file and its data
+   files together. Split what was chosen into the boot target plus the
+   loose files that must sit next to it. */
+function gameExt(name) {
+  const m = /\.([A-Za-z0-9]+)$/.exec(name || "");
+  return m ? m[1].toLowerCase() : "";
+}
+
+function pickBootName(names) {
+  const ranked = names.filter(n => GAME_BOOT_EXTS.includes(gameExt(n)));
+  if (!ranked.length) return null;
+  const byExt = ext => ranked.find(n => gameExt(n) === ext);
+  return byExt("pbp") || byExt("elf") || byExt("prx") || byExt("iso") || byExt("cso") || byExt("chd") || ranked[0];
+}
+
+// Minimal ZIP reader: central directory walk + DecompressionStream("deflate-raw")
+// for entries. Avoids shipping a zip library and works in any modern browser.
+async function unzipToFiles(file) {
+  const buf = new Uint8Array(await file.arrayBuffer());
+  const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+  const dec = new TextDecoder();
+
+  // Find End Of Central Directory (0x06054b50), scanning back over the comment.
+  let eocd = -1;
+  for (let i = buf.length - 22; i >= 0 && i >= buf.length - 22 - 65536; i--) {
+    if (dv.getUint32(i, true) === 0x06054b50) { eocd = i; break; }
+  }
+  if (eocd < 0) throw new Error("Not a ZIP file (no end-of-central-directory record)");
+  const count = dv.getUint16(eocd + 10, true);
+  let off = dv.getUint32(eocd + 16, true);
+
+  const out = [];
+  for (let n = 0; n < count; n++) {
+    if (dv.getUint32(off, true) !== 0x02014b50) throw new Error("Corrupt ZIP central directory");
+    const method  = dv.getUint16(off + 10, true);
+    const compSz  = dv.getUint32(off + 20, true);
+    const nameLen = dv.getUint16(off + 28, true);
+    const extraLen= dv.getUint16(off + 30, true);
+    const cmtLen  = dv.getUint16(off + 32, true);
+    const local   = dv.getUint32(off + 42, true);
+    const rawName = dec.decode(buf.subarray(off + 46, off + 46 + nameLen));
+    off += 46 + nameLen + extraLen + cmtLen;
+
+    if (rawName.endsWith("/")) continue;                       // directory entry
+    if (/(^|\/)(__MACOSX|\.DS_Store)/i.test(rawName)) continue; // archive cruft
+    const base = rawName.split("/").filter(Boolean).pop();
+
+    // Local header lengths differ from the central ones; read them here.
+    if (dv.getUint32(local, true) !== 0x04034b50) throw new Error("Corrupt ZIP local header");
+    const lNameLen  = dv.getUint16(local + 26, true);
+    const lExtraLen = dv.getUint16(local + 28, true);
+    const start = local + 30 + lNameLen + lExtraLen;
+    const raw = buf.subarray(start, start + compSz);
+
+    let data;
+    if (method === 0) data = raw.slice();
+    else if (method === 8) {
+      const stream = new Blob([raw]).stream().pipeThrough(new DecompressionStream("deflate-raw"));
+      data = new Uint8Array(await new Response(stream).arrayBuffer());
+    } else {
+      throw new Error(`Unsupported ZIP compression method ${method} for ${rawName}`);
+    }
+    out.push({ name: base, data });
+  }
+  return out;
+}
+
+// Normalise whatever the user handed us into { bootName, bootBytes, siblings[] }.
+async function collectGameBundle(fileList) {
+  const files = [...fileList].filter(f => f && f.size >= 0);
+  if (!files.length) throw new Error("No files selected");
+
+  // A lone .zip means "here is the whole game folder".
+  if (files.length === 1 && gameExt(files[0].name) === "zip") {
+    const entries = await unzipToFiles(files[0]);
+    if (!entries.length) throw new Error("The ZIP is empty");
+    const bootName = pickBootName(entries.map(e => e.name));
+    if (!bootName) throw new Error("No bootable game file (.PBP/.ISO/.CSO/.ELF/.PRX) found in the ZIP");
+    const boot = entries.find(e => e.name === bootName);
+    return {
+      bootName,
+      bootBytes: boot.data,
+      siblings: entries.filter(e => e.name !== bootName),
+    };
+  }
+
+  const bootName = pickBootName(files.map(f => f.name));
+  if (!bootName) throw new Error("No bootable game file selected (.PBP/.ISO/.CSO/.CHD/.ELF/.PRX)");
+  const bootFile = files.find(f => f.name === bootName);
+  const siblings = [];
+  for (const f of files) {
+    if (f === bootFile) continue;
+    siblings.push({ name: f.name, data: new Uint8Array(await f.arrayBuffer()) });
+  }
+  return { bootName, bootBytes: new Uint8Array(await bootFile.arrayBuffer()), siblings };
 }
 
 // Walk Emscripten FS recursively from root, return [{path, data}]
@@ -785,6 +890,27 @@ async function deleteGameMetadata(name) {
   try { dir = await root.getDirectoryHandle(OPFS_GAME_META_DIR); } catch(e) { return; }
   try { await dir.removeEntry(name + ".json"); } catch(e) {}
   try { await dir.removeEntry(name + ".cover"); } catch(e) {}
+  try { await dir.removeEntry(name + ".bundle.json"); } catch(e) {}
+}
+
+/* Which extra data files belong to a multi-file game. Kept per boot file so a
+   stored homebrew can be re-mounted correctly long after it was added. */
+async function recordGameBundle(bootName, siblings) {
+  await opfsMetaPut(bootName + ".bundle.json",
+    new TextEncoder().encode(JSON.stringify({ siblings: siblings.filter(Boolean) })));
+}
+
+async function storedGameBundle(bootName) {
+  try {
+    const raw = await opfsMetaRead(bootName + ".bundle.json");
+    const parsed = JSON.parse(new TextDecoder().decode(raw));
+    const names = Array.isArray(parsed?.siblings) ? parsed.siblings.filter(n => typeof n === "string" && n) : [];
+    // Drop entries the user has since deleted so playback never half-mounts.
+    const present = new Set((await opfsWalk(OPFS_GAMES_DIR, "", false)).map(g => g.path));
+    return names.filter(n => present.has(n));
+  } catch(e) {
+    return [];
+  }
 }
 
 // Categorize an OPFS path for the file browser
@@ -945,7 +1071,13 @@ async function playOrMountStoredGame(name) {
     showToast("Mounting " + name + "…");
     FS.mkdirTree(VIRTUAL_GAME_DIR);
     FS.writeFile(path, await opfsReadGame(name));
-    log("Mounted stored game file from OPFS: " + path, "ok");
+    // Re-mount the homebrew's data files so it can actually boot.
+    const siblings = await storedGameBundle(name);
+    for (const sib of siblings) {
+      FS.writeFile(VIRTUAL_GAME_DIR + "/" + sib, await opfsReadGame(sib));
+    }
+    log("Mounted stored game file from OPFS: " + path +
+        (siblings.length ? " (+" + siblings.length + " data file(s): " + siblings.join(", ") + ")" : ""), "ok");
     refreshEmulatorGameBrowser("mounted " + name);
     showToast("✓ " + name + " mounted");
     refreshLibrary();
@@ -1099,6 +1231,7 @@ function prunePreloadFavorites(games) {
   const next = favorites.filter(name => {
     const game = byName.get(name);
     if (!game) return false;                       // file was deleted
+    if (!GAME_BOOT_EXTS.includes(gameExt(name))) return false; // data files aren't standalone games
     const size = typeof game === "string" ? 0 : (game.size || 0);
     if (size > PRELOAD_MAX_BYTES) { dropped++; return false; }
     return true;
@@ -1165,9 +1298,11 @@ async function refreshLibrary() {
       const format = meta.format || (game.path.split(".").pop() || "").toUpperCase();
       const mounted = !!window.FS?.analyzePath?.(VIRTUAL_GAME_DIR + "/" + game.path).exists;
       const preloads = preloadFavorites.has(game.path);
-      const primary = started ? (mounted ? "Ready" : "Mount") : "Play";
+      const isBoot = GAME_BOOT_EXTS.includes(gameExt(game.path));
+      const primary = started ? (mounted ? "Ready" : "Mount") : (isBoot ? "Play" : "Load");
       const primaryDisabled = started && mounted ? " disabled" : "";
       const fallback = title.split(/\s+/).slice(0, 4).join(" ");
+      const dataTag = isBoot ? "" : " · Data file";
       cards.push(`
         <div class="game-card">
           <div class="game-cover" style="background:${gameAccent(game.path)}">
@@ -1177,7 +1312,7 @@ async function refreshLibrary() {
           </div>
           <div class="game-card-body">
             <div class="game-card-title" title="${esc(title)}">${esc(title)}</div>
-            <div class="game-card-meta" title="${esc(game.path)}">${esc(format)} · ${formatBytes(game.size || 0)}${preloads ? " · Preload" : ""}</div>
+            <div class="game-card-meta" title="${esc(game.path)}">${esc(format)} · ${formatBytes(game.size || 0)}${preloads ? " · Preload" : ""}${dataTag}</div>
             <div class="game-card-actions">
               <button data-action="play" data-game="${esc(game.path)}"${primaryDisabled}>${primary}</button>
               <button class="icon-only preload-toggle${preloads ? " active" : ""}" title="${preloads ? "Remove from startup preload" : "Preload on startup"}" aria-pressed="${preloads ? "true" : "false"}" data-action="favorite" data-game="${esc(game.path)}">${svgIcon("preload")}</button>
@@ -1199,18 +1334,27 @@ async function refreshLibrary() {
   }
 }
 
-async function addGameToLibrary(file) {
-  showToast("Adding " + file.name + "…");
+async function addGameToLibrary(files) {
+  const list = files instanceof File ? [files] : [...(files || [])];
+  if (!list.length) return;
+  showToast("Adding " + list.map(f => f.name).join(", ") + "…");
   try {
-    const bytes = new Uint8Array(await file.arrayBuffer());
-    const storedName = await storeGameBytes(file.name, bytes);
-    log("Library: added " + storedName + " to OPFS.", "ok");
-    showToast("✓ Added " + storedName);
+    const bundle = await collectGameBundle(list);
+    const bootStored = await storeGameBytes(bundle.bootName, bundle.bootBytes);
+    const siblingNames = [];
+    for (const sib of bundle.siblings) {
+      siblingNames.push(await storeGameBytes(sib.name, sib.data));
+    }
+    if (siblingNames.length) await recordGameBundle(bootStored, siblingNames);
+    log("Library: added " + bootStored +
+        (siblingNames.length ? " (+" + siblingNames.length + " data file(s): " + siblingNames.join(", ") + ")" : "") + " to OPFS.", "ok");
+    showToast("✓ Added " + bootStored +
+      (siblingNames.length ? " + " + siblingNames.length + " data file(s)" : ""));
     await refreshLibrary();
     updateStorageInfo();
   } catch(e) {
     log("Library add failed: " + e.message, "err");
-    showToast("❌ " + e.message);
+    showToast("❌ " + e.message, 5000);
   }
 }
 
@@ -3107,21 +3251,41 @@ async function downloadAllDriveGames() {
 }
 
 /* ── Runtime game loading (while PPSSPP is running) ─────────────── */
-async function loadGameAtRuntime(file) {
+async function loadGameAtRuntime(files) {
   const FS = window.FS;
   if (!FS) { showToast("⚠ Start PPSSPP first"); return; }
-  const safe = file.name.replace(/[^a-zA-Z0-9._\-]/g, "_");
-  const path = VIRTUAL_GAME_DIR + "/" + safe;
-  log("Loading game at runtime: " + file.name + " → " + path, "info");
-  showToast("Loading " + file.name + "…");
+  let bundle;
   try {
-    const bytes = new Uint8Array(await file.arrayBuffer());
+    bundle = await collectGameBundle(files);
+  } catch(e) {
+    log("Runtime game load failed: " + e.message, "err");
+    showToast("❌ " + e.message, 5000);
+    return;
+  }
+  const safe = bundle.bootName.replace(/[^a-zA-Z0-9._\-]/g, "_");
+  const path = VIRTUAL_GAME_DIR + "/" + safe;
+  log("Loading game at runtime: " + bundle.bootName + " → " + path, "info");
+  showToast("Loading " + bundle.bootName + "…");
+  try {
     try { FS.mkdirTree(VIRTUAL_GAME_DIR); } catch(e) {}
-    FS.writeFile(path, bytes);
-    await opfsPutGame(file.name, bytes);
+    FS.writeFile(path, bundle.bootBytes);
+    await opfsPutGame(bundle.bootName, bundle.bootBytes);
+    // Data files (data.csz, assets, …) must sit beside the boot target.
+    const siblingNames = [];
+    for (const sib of bundle.siblings) {
+      const sibSafe = sib.name.replace(/[^a-zA-Z0-9._\-]/g, "_");
+      FS.writeFile(VIRTUAL_GAME_DIR + "/" + sibSafe, sib.data);
+      siblingNames.push(sibSafe);
+      try { await opfsPutGame(sib.name, sib.data); }
+      catch(e) { log("Could not persist " + sib.name + " in OPFS: " + e.message, "warn"); }
+    }
+    if (siblingNames.length) {
+      try { await recordGameBundle(safe, siblingNames); }
+      catch(e) { log("Could not record game bundle: " + e.message, "warn"); }
+    }
     refreshEmulatorGameBrowser("mounted " + safe);
     log("Game file ready at " + path + " and saved to OPFS. Open it from PPSSPP\u2019s game browser (Home \u2192 Games).", "ok");
-    showToast("✓ " + file.name + " loaded → open from PPSSPP game browser", 5000);
+    showToast("✓ " + bundle.bootName + " loaded → open from PPSSPP game browser", 5000);
     refreshLibrary();
     updateStorageInfo();
   } catch(e) { log("Runtime game load failed: " + e.message, "err"); showToast("❌ " + e.message); }
@@ -4355,7 +4519,7 @@ async function preloadGame(FS) {
   setStatus("Fast loading game: " + sourceName, "run");
   showLoading("Fast loading game: " + sourceName);
 
-  if (selectedGame) {
+  if (selectedGame && !selectedSiblings.length) {
     const fastPath = mountGameFileFast(FS, selectedGame, safe, "selected file");
     if (fastPath) {
       persistSelectedGameInBackground(selectedGame);
@@ -4363,8 +4527,10 @@ async function preloadGame(FS) {
     }
   } else if (selectedStoredGame) {
     const storedFile = await opfsGetGameFile(selectedStoredGame);
-    const fastPath = mountGameFileFast(FS, storedFile, safe, "OPFS");
-    if (fastPath) return fastPath;
+    if (!(await storedGameBundle(selectedStoredGame)).length) {
+      const fastPath = mountGameFileFast(FS, storedFile, safe, "OPFS");
+      if (fastPath) return fastPath;
+    }
   }
 
   setStatus("Loading game into memory: " + sourceName, "run");
@@ -4375,7 +4541,29 @@ async function preloadGame(FS) {
   FS.writeFile(path, bytes);
   try { if (selectedGame) await opfsPutGame(selectedGame.name, bytes); }
   catch(e) { log("Could not persist game in OPFS: " + e.message, "warn"); }
-  log("Game mounted in MEMFS" + (selectedGame ? " and saved to OPFS" : " from OPFS") + ": " + path, "ok");
+
+  // Data files (data.csz, assets, …) must sit beside the boot target.
+  const siblings = selectedGame
+    ? selectedSiblings
+    : await Promise.all((await storedGameBundle(selectedStoredGame))
+        .map(async n => ({ name: n, data: await opfsReadGame(n) })));
+  const siblingNames = [];
+  for (const sib of siblings) {
+    const sibSafe = sib.name.replace(/[^a-zA-Z0-9._-]/g, "_");
+    FS.writeFile(VIRTUAL_GAME_DIR + "/" + sibSafe, sib.data);
+    siblingNames.push(sibSafe);
+    if (selectedGame) {
+      try { await opfsPutGame(sib.name, sib.data); }
+      catch(e) { log("Could not persist " + sib.name + " in OPFS: " + e.message, "warn"); }
+    }
+  }
+  if (selectedGame && siblingNames.length) {
+    try { await recordGameBundle(safe, siblingNames); }
+    catch(e) { log("Could not record game bundle: " + e.message, "warn"); }
+  }
+
+  log("Game mounted in MEMFS" + (selectedGame ? " and saved to OPFS" : " from OPFS") + ": " + path +
+      (siblingNames.length ? " (+" + siblingNames.length + " data file(s): " + siblingNames.join(", ") + ")" : ""), "ok");
   return path;
 }
 
@@ -4638,16 +4826,37 @@ function installTouchMouseShim() {
 }
 
 /* ── Event wiring ───────────────────────────────────────────────── */
-on(fileInput, "change", () => {
-  selectedGame = fileInput?.files?.[0] || null;
+on(fileInput, "change", async () => {
+  const picked = [...(fileInput?.files || [])];
+  selectedGame = null;
+  selectedSiblings = [];
   selectedStoredGame = null;
-  if (fileLabel) fileLabel.title = selectedGame ? selectedGame.name : "Open game";
+
+  if (picked.length) {
+    try {
+      const bundle = await collectGameBundle(picked);
+      selectedGame = new File([bundle.bootBytes], bundle.bootName, { type: "application/octet-stream" });
+      selectedSiblings = bundle.siblings;
+    } catch(e) {
+      if (fileInput) fileInput.value = "";
+      log("Game selection failed: " + e.message, "err");
+      setStatus(e.message, "err");
+      showToast("❌ " + e.message, 5000);
+      updateIdleOverlay();
+      return;
+    }
+  }
+
+  const label = selectedGame
+    ? selectedGame.name + (selectedSiblings.length ? "  +" + selectedSiblings.length + " data file(s)" : "")
+    : "";
+  if (fileLabel) fileLabel.title = selectedGame ? label : "Open game";
   // Update the visible text node inside the label
   const textNode = fileLabel?.firstChild;
   if (textNode && textNode.nodeType === 3)
-    textNode.textContent = (selectedGame ? "\uD83D\uDCC2 " + selectedGame.name : "\uD83D\uDCC2 Open Game") + " ";
+    textNode.textContent = (selectedGame ? "\uD83D\uDCC2 " + label : "\uD83D\uDCC2 Open Game") + " ";
   updateIdleOverlay();
-  setStatus(selectedGame ? "Selected: " + selectedGame.name : "Ready. Open a game file or use Library.");
+  setStatus(selectedGame ? "Selected: " + label : "Ready. Open a game file or use Library.");
 });
 
 on(startBtn, "click", () => {
@@ -4668,9 +4877,9 @@ on("libraryGrid", "click", e => {
   else if (button.dataset.action === "delete") deleteStoredFile(VIRTUAL_GAME_DIR + "/" + name);
 });
 on("libraryImportFile", "change", e => {
-  const f = e.target.files[0]; if (!f) return;
+  const files = [...(e.target.files || [])]; if (!files.length) return;
   e.target.value = "";
-  addGameToLibrary(f);
+  addGameToLibrary(files);
 });
 on("libraryDownloadUrlBtn", "click", () => {
   addGameURLToLibrary(byId("libraryUrlInput")?.value || "");
@@ -4687,9 +4896,9 @@ on("gameInfoModal", "click", e => {
 
 // ── Runtime game loading ─────────────────────────────────────────
 runtimeGameInput?.addEventListener("change", e => {
-  const f = e.target.files[0]; if (!f) return;
+  const files = [...(e.target.files || [])]; if (!files.length) return;
   e.target.value = "";
-  loadGameAtRuntime(f);
+  loadGameAtRuntime(files);
 });
 
 // ── Saves tab buttons ─────────────────────────────────────────────

@@ -13,12 +13,12 @@
     <div class="hbar-group" id="launchGroup">
       <label class="btn" id="fileLabel">
         <i data-lucide="folder-open"></i><span class="btn-lbl"> Open Game</span>
-        <input id="gameFile" type="file" accept=".iso,.cso,.chd,.pbp,.elf,.prx">
+        <input id="gameFile" type="file" multiple accept=".iso,.cso,.chd,.pbp,.elf,.prx,.csz,.zip">
       </label>
       <button id="startBtn" class="primary"><i data-lucide="play"></i><span class="btn-lbl"> Start PPSSPP</span></button>
       <label class="btn" id="runtimeIsoLabel" style="display:none" title="Load a game file while running — then open it from PPSSPP game browser">
         <i data-lucide="upload"></i><span class="btn-lbl"> Load Game</span>
-        <input id="runtimeIsoFile" type="file" accept=".iso,.cso,.chd,.pbp,.elf,.prx">
+        <input id="runtimeIsoFile" type="file" multiple accept=".iso,.cso,.chd,.pbp,.elf,.prx,.csz,.zip">
       </label>
     </div>
 
@@ -171,7 +171,7 @@
             <button id="refreshLibraryBtn"><i data-lucide="refresh-cw"></i> Refresh</button>
             <label class="btn" id="libraryImportLabel">
               <i data-lucide="folder-plus"></i> Add Game
-              <input id="libraryImportFile" type="file" accept=".iso,.cso,.chd,.pbp,.elf,.prx">
+              <input id="libraryImportFile" type="file" multiple accept=".iso,.cso,.chd,.pbp,.elf,.prx,.csz,.zip">
             </label>
             <input id="libraryUrlInput" type="url" placeholder="https://.../game.iso|cso|chd" autocomplete="off" spellcheck="false">
             <button id="libraryDownloadUrlBtn"><i data-lucide="download"></i> Download</button>

@@ -74,7 +74,7 @@ const PPSSPP_ICONS = {
   X,
   Zap,
 };
-const RUNTIME_ASSET_VERSION = '2026-09-24-perf-preset';
+const RUNTIME_ASSET_VERSION = '2026-09-24-multifile';
 
 @Injectable({ providedIn: 'root' })
 export class PpssppRuntime {
